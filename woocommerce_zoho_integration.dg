@@ -1,0 +1,184 @@
+string standalone.sync_woocommerce_orders(String crmAPIRequest)
+{
+//  Receiving data from the WooCommerce Webhook
+rawRequest = crmAPIRequest.toMap();
+bodyString = rawRequest.get("body");
+if(bodyString == null || bodyString == "")
+{
+	errResponse = Map();
+	errResponse.put("code","error");
+	errResponse.put("message","Empty body");
+	return errResponse.toString();
+}
+orderData = bodyString.toMap();
+orderId = ifNull(orderData.get("id"),"0");
+orderTotal = ifNull(orderData.get("total"),"0").toDecimal();
+billingData = orderData.get("billing").toMap();
+firstName = ifNull(billingData.get("first_name"),"");
+lastName = ifNull(billingData.get("last_name"),"Customer");
+email = ifNull(billingData.get("email"),"");
+phone = ifNull(billingData.get("phone"),"");
+fullName = (firstName + " " + lastName).trim();
+// [Edit 1] Create OR UPDATE Account to prevent duplication
+accountId = "";
+if(phone != "")
+{
+	searchAccount = zoho.crm.searchRecords("Accounts","(Phone:equals:" + phone + ")");
+	if(searchAccount != null && searchAccount.size() > 0)
+	{
+		accountId = searchAccount.get(0).get("id");
+	}
+}
+if(accountId == "")
+{
+	accountMap = Map();
+	accountMap.put("Account_Name",fullName + " - Account");
+	if(phone != "")
+	{
+		accountMap.put("Phone",phone);
+	}
+	createAccount = zoho.crm.createRecord("Accounts",accountMap);
+	accountId = createAccount.get("id");
+}
+// [Edit 2] Create OR UPDATE Contact (essential requirement for tasking)
+contactId = "";
+if(email != "")
+{
+	searchContact = zoho.crm.searchRecords("Contacts","(Email:equals:" + email + ")");
+	if(searchContact != null && searchContact.size() > 0)
+	{
+		// Client is present -> We are only updating
+		contactId = searchContact.get(0).get("id");
+		updateContactMap = Map();
+		updateContactMap.put("First_Name",firstName);
+		updateContactMap.put("Last_Name",lastName);
+		updateContactMap.put("Account_Name",accountId);
+		if(phone != "")
+		{
+			updateContactMap.put("Phone",phone);
+		}
+		zoho.crm.updateRecord("Contacts",contactId,updateContactMap);
+	}
+}
+// If it's not in the email or there's no email at all -> New necro
+if(contactId == "")
+{
+	contactMap = Map();
+	contactMap.put("First_Name",firstName);
+	contactMap.put("Last_Name",lastName);
+	contactMap.put("Account_Name",accountId);
+	if(email != "")
+	{
+		contactMap.put("Email",email);
+	}
+	if(phone != "")
+	{
+		contactMap.put("Phone",phone);
+	}
+	createContact = zoho.crm.createRecord("Contacts",contactMap);
+	contactId = createContact.get("id");
+}
+//  Process Products (Your excellent work remains as is)
+productDetailsList = List();
+productIdsList = List();
+simpleText = "";
+lineItems = orderData.get("line_items");
+if(lineItems != null)
+{
+	for each  item in lineItems.toList()
+	{
+		itemMap = item.toMap();
+		pName = itemMap.get("name");
+		pQty = itemMap.get("quantity").toLong();
+		pPrice = itemMap.get("price").toDecimal();
+		simpleText = simpleText + pName + " (Qty: " + pQty + " - Price: " + pPrice + " EGP) | ";
+		searchProduct = zoho.crm.searchRecords("Products","(Product_Name:equals:" + pName + ")");
+		productId = "";
+		if(searchProduct.size() > 0)
+		{
+			productId = searchProduct.get(0).get("id");
+			existingCode = ifNull(searchProduct.get(0).get("Product_Code"),"");
+			if(existingCode == "")
+			{
+				updateProductMap = Map();
+				updateProductMap.put("Product_Code","WOO-" + pName.replaceAll(" ","-").toUpperCase());
+				updateProductMap.put("Product_Active",true);
+				zoho.crm.updateRecord("Products",productId,updateProductMap);
+			}
+		}
+		else
+		{
+			newProductMap = Map();
+			newProductMap.put("Product_Name",pName);
+			newProductMap.put("Unit_Price",pPrice);
+			newProductMap.put("Product_Code","WOO-" + pName.replaceAll(" ","-").toUpperCase());
+			newProductMap.put("Product_Active",true);
+			createProd = zoho.crm.createRecord("Products",newProductMap);
+			productId = createProd.get("id");
+		}
+		productLine = Map();
+		productLine.put("product",{"id":productId});
+		productLine.put("quantity",pQty);
+		productLine.put("list_price",pPrice);
+		productLine.put("unit_price",pPrice);
+		productDetailsList.add(productLine);
+		pidMap = Map();
+		pidMap.put("id",productId);
+		productIdsList.add(pidMap);
+	}
+}
+// [Edit 3] Create Deal with anti-duplication protection
+dealId = "";
+dealName = "WooCommerce Order #" + orderId + " - " + fullName;
+searchDeal = zoho.crm.searchRecords("Deals","(Deal_Name:equals:" + dealName + ")");
+if(searchDeal != null && searchDeal.size() > 0)
+{
+	dealId = searchDeal.get(0).get("id");
+}
+else
+{
+	dealMap = Map();
+	dealMap.put("Deal_Name",dealName);
+	dealMap.put("Amount",orderTotal);
+	dealMap.put("Stage","Qualification");
+	dealMap.put("Closing_Date",today.addDay(7).toString("yyyy-MM-dd"));
+	dealMap.put("Account_Name",accountId);
+	dealMap.put("Contact_Name",contactId);
+	if(simpleText != "")
+	{
+		dealMap.put("Description","Order Details: " + simpleText);
+	}
+	createDeal = zoho.crm.createRecord("Deals",dealMap);
+	dealId = createDeal.get("id");
+	//  Linking products to the Deal via REST API
+	if(dealId != null && productIdsList.size() > 0)
+	{
+		bodyMap = Map();
+		bodyMap.put("data",productIdsList);
+		invokeurl
+		[
+			url :"https://www.zohoapis.com/crm/v2/Deals/" + dealId + "/Products"
+			type :PUT
+			parameters:bodyMap.toString()
+			connection:"zoho_crm_products"
+		]
+	}
+	//  Create Sales Order with Product Details
+	if(dealId != null && productDetailsList.size() > 0)
+	{
+		soMap = Map();
+		soMap.put("Subject","WooCommerce Order #" + orderId + " - " + fullName);
+		soMap.put("Deal_Name",dealId);
+		soMap.put("Contact_Name",contactId);
+		soMap.put("Account_Name",accountId);
+		soMap.put("Status","Created");
+		soMap.put("Product_Details",productDetailsList);
+		zoho.crm.createRecord("Sales_Orders",soMap);
+	}
+}
+response = Map();
+response.put("code","success");
+response.put("deal_id",dealId);
+response.put("contact_id",contactId);
+return response.toString();
+}
